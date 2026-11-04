@@ -1,6 +1,7 @@
 #include "managers/views/file_browser.h"
- #include "gui/screen_layout.h"
+#include "gui/screen_layout.h"
 #include "managers/views/infrared_view.h"
+#include "core/ir_database.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "managers/views/keyboard_screen.h"
@@ -111,6 +112,9 @@ static bool popup_style_initialized = false;
 
 static options_view_t *g_ir_ov = NULL;
 static void back_event_cb(lv_event_t *e);
+static void ir_db_open_categories(void);
+static void ir_db_open_brands(int cat_idx);
+static void ir_db_open_commands(int cat_idx, int brand_idx);
 #if defined(CONFIG_USE_ENCODER) || defined(CONFIG_USE_JOYSTICK) || defined(CONFIG_USE_ATOMS3R_BUTTON)
 static void ir_add_back_row(void);
 #endif
@@ -129,6 +133,14 @@ static char current_dir[256] = "/mnt/ghostesp";
 static bool has_remotes_option = false;
 static bool has_universals_option = false;
 static bool in_universals_mode = false;
+
+/* ── IR Database browser state ──────────────────────────────────────────── */
+static bool s_in_ir_db_mode = false;
+static int  s_ir_db_level     = 0; /* 0=categories, 1=brands, 2=commands */
+static int  s_ir_db_cat_idx   = 0;
+static int  s_ir_db_brand_idx = 0;
+/* ─────────────────────────────────────────────────────────────────────── */
+
 // Deep-link request (favorite launch): full path of the remote to open as
 // soon as the view is created, or immediately if it is already running.
 static char *s_pending_remote_open = NULL;
@@ -1221,6 +1233,21 @@ static void universal_transmit_task(void *arg) {
 #endif
 
 static void back_event_cb(lv_event_t *e) {
+    /* IR database browser navigation */
+    if (s_in_ir_db_mode) {
+        if (s_ir_db_level == 2) {
+            ir_db_open_brands(s_ir_db_cat_idx);
+            return;
+        } else if (s_ir_db_level == 1) {
+            ir_db_open_categories();
+            return;
+        } else {
+            /* level 0 — back to root menu */
+            s_in_ir_db_mode = false;
+            s_ir_db_level   = 0;
+        }
+    }
+
     if (showing_commands) {
         // if currently showing commands, return to file list
         showing_commands = false;
@@ -1279,6 +1306,7 @@ static void back_event_cb(lv_event_t *e) {
         if (g_ir_ov) options_view_clear(g_ir_ov);
         options_view_add_item(g_ir_ov, "Remotes", remotes_event_cb, NULL);
         options_view_add_item(g_ir_ov, "Universals", universals_event_cb, NULL);
+        options_view_add_item(g_ir_ov, "IR Database", ir_database_event_cb, NULL);
 #ifdef CONFIG_HAS_INFRARED_RX
         is_easy_mode = settings_get_infrared_easy_mode(&G_Settings);
         options_view_add_item(g_ir_ov, "Learn Remote", learn_remote_event_cb, NULL);
@@ -1341,6 +1369,7 @@ void infrared_view_create(void) {
     has_universals_option = true;
     options_view_add_item(g_ir_ov, "Remotes", remotes_event_cb, NULL);
     options_view_add_item(g_ir_ov, "Universals", universals_event_cb, NULL);
+    options_view_add_item(g_ir_ov, "IR Database", ir_database_event_cb, NULL);
 
 #ifdef CONFIG_HAS_INFRARED_RX
     ESP_LOGI(TAG, "Initializing RMT RX channel for infrared learning");
@@ -1511,6 +1540,8 @@ void infrared_view_destroy(void) {
         }
         clear_ir_file_paths();
         showing_commands = false;
+        s_in_ir_db_mode = false;
+        s_ir_db_level   = 0;
         if (g_ir_ov) { options_view_destroy(g_ir_ov); g_ir_ov = NULL; }
         lvgl_obj_del_safe(&root);
         list = NULL;
@@ -1924,6 +1955,10 @@ void infrared_view_input_cb(InputEvent *event) {
                         }
 #endif
 
+                        if (s_in_ir_db_mode) {
+                            ir_db_select_at((int)i);
+                            return;
+                        }
                         bool top_level = (has_remotes_option || has_universals_option);
                         if (!showing_commands) {
                             if (top_level) {
@@ -1931,19 +1966,22 @@ void infrared_view_input_cb(InputEvent *event) {
                                     remotes_event_cb(NULL);
                                 } else if (has_universals_option && i == (has_remotes_option ? 1 : 0)) {
                                     universals_event_cb(NULL);
-#ifdef CONFIG_HAS_INFRARED_RX
                                 } else if (i == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0))) {
-                                    learn_remote_event_cb(NULL);
+                                    ir_database_event_cb(NULL);
+#ifdef CONFIG_HAS_INFRARED_RX
                                 } else if (i == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
-                                    easy_learn_toggle_cb(NULL);
+                                    learn_remote_event_cb(NULL);
                                 } else if (i == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 2)) {
+                                    easy_learn_toggle_cb(NULL);
+                                } else if (i == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 3)) {
                                     dazzler_event_cb(NULL);
 #else
-                                } else if (i == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0))) {
+                                } else if (i == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
                                     dazzler_event_cb(NULL);
 #endif
                                 } else {
-                                    int top_count = (has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0);
+                                    int top_count = (has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0)
+                                        + 1;  // IR Database
 #ifdef CONFIG_HAS_INFRARED_RX
                                     top_count += 2;
 #endif
@@ -2001,6 +2039,10 @@ void infrared_view_input_cb(InputEvent *event) {
                 return;
             }
 #endif
+            if (s_in_ir_db_mode) {
+                ir_db_select_at(selected_ir_index);
+                return;
+            }
             bool top_level = (has_remotes_option || has_universals_option);
             if (!showing_commands) {
                 if (top_level && has_remotes_option && selected_ir_index == 0) {
@@ -2009,23 +2051,26 @@ void infrared_view_input_cb(InputEvent *event) {
                 } else if (top_level && has_universals_option && selected_ir_index == (has_remotes_option ? 1 : 0)) {
                     ESP_LOGI(TAG, "joystick enter pressed on Universals, opening universals directory");
                     universals_event_cb(NULL);
-#ifdef CONFIG_HAS_INFRARED_RX
                 } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0))) {
+                    ir_database_event_cb(NULL);
+#ifdef CONFIG_HAS_INFRARED_RX
+                } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
                     ESP_LOGI(TAG, "joystick enter pressed on Learn Remote, starting IR learning");
                     learn_remote_event_cb(NULL);
-                } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
+                } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 2)) {
                     ESP_LOGI(TAG, "joystick enter pressed on Easy Learn toggle");
                     easy_learn_toggle_cb(NULL);
-                } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 2)) {
+                } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 3)) {
                     ESP_LOGI(TAG, "joystick enter pressed on IR Dazzler");
                     dazzler_event_cb(NULL);
 #else
-                } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0))) {
+                } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
                     ESP_LOGI(TAG, "joystick enter pressed on IR Dazzler");
                     dazzler_event_cb(NULL);
 #endif
                 } else {
                     int top_count = (has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0)
+                        + 1  // IR Database
 #ifdef CONFIG_HAS_INFRARED_RX
                         + 2  // Account for both Learn Remote and Easy Learn buttons
 #endif
@@ -2086,6 +2131,10 @@ void infrared_view_input_cb(InputEvent *event) {
                 return;
             }
 #endif
+            if (s_in_ir_db_mode) {
+                ir_db_select_at(selected_ir_index);
+                return;
+            }
             bool top_level = (has_remotes_option || has_universals_option);
             if (!showing_commands) {
                 // Check if we're in the top-level menu or in a file list
@@ -2097,23 +2146,26 @@ void infrared_view_input_cb(InputEvent *event) {
                     } else if (has_universals_option && selected_ir_index == (has_remotes_option ? 1 : 0)) {
                         ESP_LOGI(TAG, "Keyboard Enter pressed on Universals, opening universals directory");
                         universals_event_cb(NULL);
-#ifdef CONFIG_HAS_INFRARED_RX
                     } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0))) {
+                        ir_database_event_cb(NULL);
+#ifdef CONFIG_HAS_INFRARED_RX
+                    } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
                         ESP_LOGI(TAG, "Keyboard Enter pressed on Learn Remote");
                         learn_remote_event_cb(NULL);
-                    } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
+                    } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 2)) {
                         ESP_LOGI(TAG, "Keyboard Enter pressed on Easy Learn");
                         easy_learn_toggle_cb(NULL);
-                    } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 2)) {
+                    } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 3)) {
                         ESP_LOGI(TAG, "Keyboard Enter pressed on IR Dazzler");
                         dazzler_event_cb(NULL);
 #else
-                    } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0))) {
+                    } else if (top_level && selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
                         ESP_LOGI(TAG, "Keyboard Enter pressed on IR Dazzler");
                         dazzler_event_cb(NULL);
 #endif
                     } else {
                         int top_count = (has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0)
+                            + 1  // IR Database
 #ifdef CONFIG_HAS_INFRARED_RX
                             + 2  // Account for both Learn Remote and Easy Learn buttons
 #endif
@@ -2173,6 +2225,10 @@ void infrared_view_input_cb(InputEvent *event) {
                 back_event_cb(NULL);
                 return;
             }
+            if (s_in_ir_db_mode) {
+                ir_db_select_at(selected_ir_index);
+                return;
+            }
             if (!showing_commands) {
                 // Check if we're in the top-level menu or in a file list
                 if (has_remotes_option || has_universals_option) {
@@ -2181,19 +2237,22 @@ void infrared_view_input_cb(InputEvent *event) {
                         remotes_event_cb(NULL);
                     } else if (has_universals_option && selected_ir_index == (has_remotes_option ? 1 : 0)) {
                         universals_event_cb(NULL);
-#ifdef CONFIG_HAS_INFRARED_RX
                     } else if (selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0))) {
-                        learn_remote_event_cb(NULL);
+                        ir_database_event_cb(NULL);
+#ifdef CONFIG_HAS_INFRARED_RX
                     } else if (selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
-                        easy_learn_toggle_cb(NULL);
+                        learn_remote_event_cb(NULL);
                     } else if (selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 2)) {
+                        easy_learn_toggle_cb(NULL);
+                    } else if (selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 3)) {
                         dazzler_event_cb(NULL);
 #else
-                    } else if (selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0))) {
+                    } else if (selected_ir_index == ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0) + 1)) {
                         dazzler_event_cb(NULL);
 #endif
                     } else {
                         int file_idx = selected_ir_index - ((has_remotes_option ? 1 : 0) + (has_universals_option ? 1 : 0)
+                            + 1  // IR Database
 #ifdef CONFIG_HAS_INFRARED_RX
                             + 2  // Account for both Learn Remote and Easy Learn buttons
 #endif
@@ -2747,6 +2806,142 @@ void delete_remote_cb(lv_event_t *e) {
                        "This remote will be permanently deleted.",
                        "Delete", "Cancel", ir_delete_remote_confirm_cb, NULL);
 }
+
+/* ── IR Database browser implementation ─────────────────────────────────── */
+
+static void ir_db_command_cb(lv_event_t *e) {
+    int cmd_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_ir_db_cat_idx < 0 || s_ir_db_cat_idx >= IR_DB_CATEGORY_COUNT) return;
+    const ir_db_category_t *cat = &ir_db_categories[s_ir_db_cat_idx];
+    if (s_ir_db_brand_idx < 0 || s_ir_db_brand_idx >= cat->brand_count) return;
+    const ir_db_brand_t *brand = &cat->brands[s_ir_db_brand_idx];
+    if (cmd_idx < 0 || cmd_idx >= brand->entry_count) return;
+    const ir_db_entry_t *entry = &brand->entries[cmd_idx];
+
+    infrared_signal_t sig = {0};
+    sig.is_raw = false;
+    strncpy(sig.name, entry->name, sizeof(sig.name) - 1);
+    strncpy(sig.payload.message.protocol, entry->protocol,
+            sizeof(sig.payload.message.protocol) - 1);
+    sig.payload.message.address = entry->address;
+    sig.payload.message.command = entry->command;
+    infrared_manager_transmit(&sig);
+    status_display_show_status("IR Sent");
+}
+
+static void ir_db_brand_cb(lv_event_t *e) {
+    int brand_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    ir_db_open_commands(s_ir_db_cat_idx, brand_idx);
+}
+
+static void ir_db_cat_cb(lv_event_t *e) {
+    int cat_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    ir_db_open_brands(cat_idx);
+}
+
+static void ir_db_open_commands(int cat_idx, int brand_idx) {
+    if (!g_ir_ov) return;
+    s_ir_db_level     = 2;
+    s_ir_db_cat_idx   = cat_idx;
+    s_ir_db_brand_idx = brand_idx;
+
+    const ir_db_category_t *cat   = &ir_db_categories[cat_idx];
+    const ir_db_brand_t    *brand = &cat->brands[brand_idx];
+
+    options_view_clear(g_ir_ov);
+    options_view_set_title(g_ir_ov, brand->brand);
+
+    for (int i = 0; i < brand->entry_count; i++) {
+        options_view_add_item(g_ir_ov, brand->entries[i].name,
+                              ir_db_command_cb, (void *)(intptr_t)i);
+    }
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_USE_JOYSTICK) || defined(CONFIG_USE_ATOMS3R_BUTTON)
+    ir_add_back_row();
+#else
+    options_view_add_back_row(g_ir_ov, back_event_cb, NULL);
+#endif
+    num_ir_items = options_view_get_item_count(g_ir_ov);
+    if (num_ir_items > 0) options_view_set_selected(g_ir_ov, 0);
+    selected_ir_index = 0;
+}
+
+static void ir_db_open_brands(int cat_idx) {
+    if (!g_ir_ov) return;
+    s_ir_db_level   = 1;
+    s_ir_db_cat_idx = cat_idx;
+
+    const ir_db_category_t *cat = &ir_db_categories[cat_idx];
+
+    options_view_clear(g_ir_ov);
+    options_view_set_title(g_ir_ov, cat->name);
+
+    for (int i = 0; i < cat->brand_count; i++) {
+        options_view_add_item(g_ir_ov, cat->brands[i].brand,
+                              ir_db_brand_cb, (void *)(intptr_t)i);
+    }
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_USE_JOYSTICK) || defined(CONFIG_USE_ATOMS3R_BUTTON)
+    ir_add_back_row();
+#else
+    options_view_add_back_row(g_ir_ov, back_event_cb, NULL);
+#endif
+    num_ir_items = options_view_get_item_count(g_ir_ov);
+    if (num_ir_items > 0) options_view_set_selected(g_ir_ov, 0);
+    selected_ir_index = 0;
+}
+
+static void ir_db_open_categories(void) {
+    if (!g_ir_ov) return;
+    s_in_ir_db_mode = true;
+    s_ir_db_level   = 0;
+
+    options_view_clear(g_ir_ov);
+    options_view_set_title(g_ir_ov, "IR Database");
+
+    for (int i = 0; i < IR_DB_CATEGORY_COUNT; i++) {
+        options_view_add_item(g_ir_ov, ir_db_categories[i].name,
+                              ir_db_cat_cb, (void *)(intptr_t)i);
+    }
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_USE_JOYSTICK) || defined(CONFIG_USE_ATOMS3R_BUTTON)
+    ir_add_back_row();
+#else
+    options_view_add_back_row(g_ir_ov, back_event_cb, NULL);
+#endif
+    num_ir_items = options_view_get_item_count(g_ir_ov);
+    if (num_ir_items > 0) options_view_set_selected(g_ir_ov, 0);
+    selected_ir_index = 0;
+}
+
+static void ir_database_event_cb(lv_event_t *e) {
+    (void)e;
+    ir_db_open_categories();
+}
+
+static void ir_db_select_at(int index) {
+    if (!s_in_ir_db_mode) return;
+    if (s_ir_db_level == 0) {
+        if (index < IR_DB_CATEGORY_COUNT) ir_db_open_brands(index);
+    } else if (s_ir_db_level == 1) {
+        const ir_db_category_t *cat = &ir_db_categories[s_ir_db_cat_idx];
+        if (index < cat->brand_count) ir_db_open_commands(s_ir_db_cat_idx, index);
+    } else if (s_ir_db_level == 2) {
+        const ir_db_category_t *cat   = &ir_db_categories[s_ir_db_cat_idx];
+        const ir_db_brand_t    *brand = &cat->brands[s_ir_db_brand_idx];
+        if (index < brand->entry_count) {
+            const ir_db_entry_t *entry = &brand->entries[index];
+            infrared_signal_t sig = {0};
+            sig.is_raw = false;
+            strncpy(sig.name, entry->name, sizeof(sig.name) - 1);
+            strncpy(sig.payload.message.protocol, entry->protocol,
+                    sizeof(sig.payload.message.protocol) - 1);
+            sig.payload.message.address = entry->address;
+            sig.payload.message.command = entry->command;
+            infrared_manager_transmit(&sig);
+            status_display_show_status("IR Sent");
+        }
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────── */
 
 // implement universals option callback
 static void universals_event_cb(lv_event_t *e) {

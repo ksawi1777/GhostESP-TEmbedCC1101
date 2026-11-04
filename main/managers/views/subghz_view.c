@@ -163,6 +163,30 @@ static bool jam_is_nrf24(jammer_freq_sel_t sel) {
     return sel >= JAM_FREQ_NRF_BT;
 }
 static jammer_freq_sel_t s_jam_sel = JAM_FREQ_433;
+
+/* ── RollJam UI ─────────────────────────────────────────────────────────── */
+static lv_obj_t *s_rolljam_row = NULL;
+static lv_obj_t *s_rolljam_popup = NULL;
+static lv_obj_t *s_rolljam_status_label = NULL;
+static lv_obj_t *s_rolljam_freq_label = NULL;
+static lv_obj_t *s_rolljam_save_btn = NULL;
+static lv_obj_t *s_rolljam_back_btn = NULL;
+
+typedef enum {
+    RJ_FREQ_433 = 0,
+    RJ_FREQ_868,
+    RJ_FREQ_315,
+    RJ_FREQ_915,
+    RJ_FREQ_COUNT
+} rolljam_freq_sel_t;
+
+static const char *s_rj_freq_names[RJ_FREQ_COUNT] = {
+    "433.92 MHz", "868.35 MHz", "315 MHz", "915 MHz"
+};
+static const uint32_t s_rj_freq_hz[RJ_FREQ_COUNT] = {
+    433920000U, 868350000U, 315000000U, 915000000U
+};
+static rolljam_freq_sel_t s_rj_sel = RJ_FREQ_433;
 /* ─────────────────────────────────────────────────────────────────────── */
 
 #ifdef CONFIG_USE_TOUCHSCREEN
@@ -943,6 +967,7 @@ static void subghz_back_to_root_menu(void) {
     s_freq_analyzer_row = options_view_add_item(s_ov, "Freq Analyzer", subghz_freq_analyzer_row_cb, NULL);
     s_waterfall_row = options_view_add_item(s_ov, "Waterfall", subghz_waterfall_row_cb, NULL);
     s_jammer_row = options_view_add_item(s_ov, "Jammer", subghz_jammer_row_cb, NULL);
+    s_rolljam_row = options_view_add_item(s_ov, "RollJam", subghz_rolljam_row_cb, NULL);
     s_back_row = options_view_add_back_row(s_ov, subghz_back_row_cb, NULL);
     options_view_set_selected(s_ov, 0);
 
@@ -3459,6 +3484,168 @@ static void subghz_jammer_row_cb(lv_event_t *e) {
     subghz_open_jammer_popup();
 }
 
+/* ── RollJam UI implementation ──────────────────────────────────────────── */
+
+static const char *subghz_rolljam_phase_text(rolljam_phase_t ph) {
+    switch (ph) {
+    case ROLLJAM_PHASE_ARMED:   return "ARMED - press remote";
+    case ROLLJAM_PHASE_GOT1:    return "GOT CODE 1 - press again";
+    case ROLLJAM_PHASE_REPLAY:  return "REPLAYING CODE 1...";
+    case ROLLJAM_PHASE_DONE:    return "DONE - code 2 saved";
+    case ROLLJAM_PHASE_ERROR:   return "ERROR";
+    default:                    return "UNKNOWN";
+    }
+}
+
+static void subghz_rolljam_update_ui(void) {
+    if (!s_rolljam_popup || !lv_obj_is_valid(s_rolljam_popup)) {
+        return;
+    }
+    rolljam_phase_t ph = subghz_remote_manager_rolljam_phase();
+    bool running = subghz_remote_manager_rolljam_is_running();
+
+    if (s_rolljam_status_label && lv_obj_is_valid(s_rolljam_status_label)) {
+        char buf[64];
+        if (running) {
+            snprintf(buf, sizeof(buf), "%s", subghz_rolljam_phase_text(ph));
+        } else {
+            snprintf(buf, sizeof(buf), "STOPPED");
+        }
+        lv_label_set_text(s_rolljam_status_label, buf);
+    }
+    if (s_rolljam_freq_label && lv_obj_is_valid(s_rolljam_freq_label)) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "FREQ: %s", s_rj_freq_names[s_rj_sel]);
+        lv_label_set_text(s_rolljam_freq_label, buf);
+    }
+    if (s_rolljam_save_btn && lv_obj_is_valid(s_rolljam_save_btn)) {
+        bool can_save = subghz_remote_manager_rolljam_has_code2();
+        lv_obj_set_state(s_rolljam_save_btn, LV_STATE_DISABLED, !can_save);
+    }
+}
+
+static void subghz_rolljam_start_btn_cb(lv_event_t *e) {
+    (void)e;
+    if (subghz_remote_manager_rolljam_is_running()) {
+        subghz_remote_manager_rolljam_stop();
+    } else {
+        subghz_remote_manager_rolljam_start(s_rj_freq_hz[s_rj_sel]);
+    }
+    subghz_rolljam_update_ui();
+}
+
+static void subghz_rolljam_freq_btn_cb(lv_event_t *e) {
+    (void)e;
+    if (subghz_remote_manager_rolljam_is_running()) {
+        return;
+    }
+    s_rj_sel = (rolljam_freq_sel_t)((s_rj_sel + 1) % RJ_FREQ_COUNT);
+    subghz_rolljam_update_ui();
+}
+
+static void subghz_rolljam_save_btn_cb(lv_event_t *e) {
+    (void)e;
+    if (!subghz_remote_manager_rolljam_has_code2()) {
+        return;
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/sdcard/subghz/rolljam_%lu.sub",
+             (unsigned long)(esp_timer_get_time() / 1000));
+    subghz_remote_manager_rolljam_save_code2(path);
+}
+
+static void subghz_close_rolljam_popup(void);
+
+static void subghz_rolljam_back_btn_cb(lv_event_t *e) {
+    (void)e;
+    subghz_remote_manager_rolljam_stop();
+    subghz_close_rolljam_popup();
+}
+
+static void subghz_close_rolljam_popup(void) {
+    if (!s_rolljam_popup || !lv_obj_is_valid(s_rolljam_popup)) {
+        return;
+    }
+    subghz_remote_manager_rolljam_stop();
+    lvgl_obj_del_safe(&s_rolljam_popup);
+    s_rolljam_status_label = NULL;
+    s_rolljam_freq_label   = NULL;
+    s_rolljam_save_btn     = NULL;
+    s_rolljam_back_btn     = NULL;
+}
+
+static void subghz_open_rolljam_popup(void) {
+    if (s_rolljam_popup && lv_obj_is_valid(s_rolljam_popup)) {
+        return;
+    }
+
+    popup_calc_size_t sz;
+    popup_calc_size(&sz);
+
+    lv_obj_t *cont = popup_create_container(s_root, sz.width, sz.height, false);
+    if (!cont) {
+        return;
+    }
+    s_rolljam_popup = cont;
+
+    lv_coord_t pw = sz.width;
+    lv_coord_t ph = sz.height;
+    lv_coord_t y  = 4;
+
+    popup_create_title_label(cont, "ROLLJAM",
+                             accessibility_font(ACCESS_FONT_MEDIUM), y);
+    y += 20;
+
+    s_rolljam_status_label = popup_create_body_label(
+        cont, "ARMED - press remote", pw - 16, false,
+        accessibility_font(ACCESS_FONT_SMALL), y);
+    y += 18;
+
+    char freq_buf[32];
+    snprintf(freq_buf, sizeof(freq_buf), "FREQ: %s", s_rj_freq_names[s_rj_sel]);
+    s_rolljam_freq_label = popup_create_body_label(
+        cont, freq_buf, pw - 16, false,
+        accessibility_font(ACCESS_FONT_SMALL), y);
+    y += 18;
+
+    lv_coord_t btn_h = (lv_coord_t)(ph > 140 ? 28 : 24);
+    lv_coord_t btn_w = (lv_coord_t)((pw - 24) / 2);
+
+    lv_obj_t *start_btn = popup_add_styled_button(
+        cont, "START", btn_w, btn_h,
+        LV_ALIGN_TOP_LEFT, 8, y,
+        accessibility_font(ACCESS_FONT_SMALL),
+        subghz_rolljam_start_btn_cb, NULL);
+
+    popup_add_styled_button(
+        cont, "FREQ", btn_w, btn_h,
+        LV_ALIGN_TOP_RIGHT, -8, y,
+        accessibility_font(ACCESS_FONT_SMALL),
+        subghz_rolljam_freq_btn_cb, NULL);
+    y += btn_h + 6;
+
+    s_rolljam_save_btn = popup_add_styled_button(
+        cont, "SAVE CODE 2", btn_w, btn_h,
+        LV_ALIGN_TOP_LEFT, 8, y,
+        accessibility_font(ACCESS_FONT_SMALL),
+        subghz_rolljam_save_btn_cb, NULL);
+    lv_obj_set_state(s_rolljam_save_btn, LV_STATE_DISABLED, true);
+
+    s_rolljam_back_btn = popup_add_styled_button(
+        cont, "BACK", btn_w, btn_h,
+        LV_ALIGN_TOP_RIGHT, -8, y,
+        accessibility_font(ACCESS_FONT_SMALL),
+        subghz_rolljam_back_btn_cb, NULL);
+
+    popup_set_button_selected(start_btn, true);
+    subghz_rolljam_update_ui();
+}
+
+static void subghz_rolljam_row_cb(lv_event_t *e) {
+    (void)e;
+    subghz_open_rolljam_popup();
+}
+
 /* ─────────────────────────────────────────────────────────────────────── */
 
 static void subghz_scan_row_cb(lv_event_t *e) {
@@ -4803,6 +4990,7 @@ void subghz_view_create(void) {
     s_freq_analyzer_row = options_view_add_item(s_ov, "Freq Analyzer", subghz_freq_analyzer_row_cb, NULL);
     s_waterfall_row = options_view_add_item(s_ov, "Waterfall", subghz_waterfall_row_cb, NULL);
     s_jammer_row = options_view_add_item(s_ov, "Jammer", subghz_jammer_row_cb, NULL);
+    s_rolljam_row = options_view_add_item(s_ov, "RollJam", subghz_rolljam_row_cb, NULL);
     s_back_row = options_view_add_back_row(s_ov, subghz_back_row_cb, NULL);
     if (gui_router_previous_view() == &main_menu_view) {
         s_root_selected_index = 0;
@@ -4854,6 +5042,7 @@ void subghz_view_destroy(void) {
     subghz_close_freq_analyzer_popup();
     subghz_close_waterfall_popup();
     subghz_close_jammer_popup();
+    subghz_close_rolljam_popup();
     popup_confirm_close(&s_saved_delete_confirm);
     subghz_close_saved_popup();
     subghz_saved_list_clear();
@@ -4872,6 +5061,7 @@ void subghz_view_destroy(void) {
     s_freq_analyzer_row = NULL;
     s_waterfall_row = NULL;
     s_jammer_row = NULL;
+    s_rolljam_row = NULL;
     s_back_row = NULL;
 
 #ifdef CONFIG_USE_TOUCHSCREEN

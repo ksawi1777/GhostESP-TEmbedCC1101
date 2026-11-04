@@ -54,4 +54,18 @@ bool subghz_remote_manager_jammer_start(uint32_t freq_hz);
 void subghz_remote_manager_jammer_stop(void);
 bool subghz_remote_manager_jammer_is_running(void);
 
+typedef enum {
+    ROLLJAM_PHASE_ARMED = 0,
+    ROLLJAM_PHASE_GOT1,
+    ROLLJAM_PHASE_REPLAY,
+    ROLLJAM_PHASE_DONE,
+    ROLLJAM_PHASE_ERROR,
+} rolljam_phase_t;
+
+bool subghz_remote_manager_rolljam_start(uint32_t freq_hz);
+void subghz_remote_manager_rolljam_stop(void);
+rolljam_phase_t subghz_remote_manager_rolljam_phase(void);
+bool subghz_remote_manager_rolljam_has_code2(void);
+bool subghz_remote_manager_rolljam_save_code2(const char *path);
+
 #endif
