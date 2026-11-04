@@ -20,6 +20,7 @@
 #include "managers/status_display_manager.h"
 #include "managers/subghz_decoders.h"
 #include "managers/subghz_remote_manager.h"
+#include "managers/nrf24_remote_manager.h"
 #include "managers/views/error_popup.h"
 #include "managers/views/main_menu_screen.h"
 #include "managers/views/options_screen.h"
@@ -127,6 +128,42 @@ static lv_obj_t *s_capture_row = NULL;
 static lv_obj_t *s_raw_capture_row = NULL;
 static lv_obj_t *s_freq_analyzer_row = NULL;
 static lv_obj_t *s_back_row = NULL;
+
+/* ── Jammer UI ─────────────────────────────────────────────────────────── */
+static lv_obj_t *s_jammer_row = NULL;
+static lv_obj_t *s_jammer_popup = NULL;
+static lv_obj_t *s_jammer_status_label = NULL;
+static lv_obj_t *s_jammer_toggle_btn = NULL;
+static lv_obj_t *s_jammer_freq_label = NULL;
+static lv_obj_t *s_jammer_back_btn = NULL;
+
+typedef enum {
+    JAM_FREQ_433 = 0,
+    JAM_FREQ_868,
+    JAM_FREQ_315,
+    JAM_FREQ_915,
+    JAM_FREQ_NRF_BT,     /* NRF24: 2402 MHz — BT advertising ch37 */
+    JAM_FREQ_NRF_WIFI6,  /* NRF24: 2437 MHz — WiFi ch6            */
+    JAM_FREQ_NRF_SWEEP,  /* NRF24: sweep 2400–2525 MHz            */
+    JAM_FREQ_COUNT
+} jammer_freq_sel_t;
+
+static const char *s_jam_freq_names[JAM_FREQ_COUNT] = {
+    "433.92 MHz", "868.35 MHz", "315 MHz", "915 MHz",
+    "NRF BT 2402", "NRF WiFi 2437", "NRF Sweep"
+};
+/* NRF24 entries: >= 2 GHz → routed to nrf24 jammer.
+ * 0xFFFFFFFF = sweep sentinel. */
+static const uint32_t s_jam_freq_hz[JAM_FREQ_COUNT] = {
+    433920000U, 868350000U, 315000000U, 915000000U,
+    2402000000U, 2437000000U, 0xFFFFFFFFU
+};
+
+static bool jam_is_nrf24(jammer_freq_sel_t sel) {
+    return sel >= JAM_FREQ_NRF_BT;
+}
+static jammer_freq_sel_t s_jam_sel = JAM_FREQ_433;
+/* ─────────────────────────────────────────────────────────────────────── */
 
 #ifdef CONFIG_USE_TOUCHSCREEN
 static lv_obj_t *s_scroll_up_btn = NULL;
@@ -308,6 +345,13 @@ static void subghz_wf_start_btn_cb(lv_event_t *e);
 static void subghz_wf_stop_btn_cb(lv_event_t *e);
 static void subghz_wf_back_btn_cb(lv_event_t *e);
 static void subghz_saved_list_reload(void);
+static void subghz_jammer_row_cb(lv_event_t *e);
+static void subghz_jammer_toggle_btn_cb(lv_event_t *e);
+static void subghz_jammer_freq_btn_cb(lv_event_t *e);
+static void subghz_jammer_back_btn_cb(lv_event_t *e);
+static void subghz_open_jammer_popup(void);
+static void subghz_close_jammer_popup(void);
+static void subghz_jammer_update_ui(void);
 static void subghz_scan_row_cb(lv_event_t *e);
 static void subghz_capture_row_cb(lv_event_t *e);
 static void subghz_raw_capture_row_cb(lv_event_t *e);
@@ -898,6 +942,7 @@ static void subghz_back_to_root_menu(void) {
     s_capture_row = options_view_add_item(s_ov, "Saved", subghz_capture_row_cb, NULL);
     s_freq_analyzer_row = options_view_add_item(s_ov, "Freq Analyzer", subghz_freq_analyzer_row_cb, NULL);
     s_waterfall_row = options_view_add_item(s_ov, "Waterfall", subghz_waterfall_row_cb, NULL);
+    s_jammer_row = options_view_add_item(s_ov, "Jammer", subghz_jammer_row_cb, NULL);
     s_back_row = options_view_add_back_row(s_ov, subghz_back_row_cb, NULL);
     options_view_set_selected(s_ov, 0);
 
@@ -3267,6 +3312,155 @@ static void subghz_select_row(void) {
     }
 }
 
+/* ── Jammer UI implementation ──────────────────────────────────────────── */
+
+static bool subghz_jammer_any_running(void) {
+    return subghz_remote_manager_jammer_is_running() ||
+           nrf24_remote_manager_jammer_is_running();
+}
+
+static void subghz_jammer_stop_all(void) {
+    subghz_remote_manager_jammer_stop();
+    nrf24_remote_manager_jammer_stop();
+}
+
+static void subghz_jammer_update_ui(void) {
+    if (!s_jammer_popup || !lv_obj_is_valid(s_jammer_popup)) {
+        return;
+    }
+    bool running = subghz_jammer_any_running();
+
+    if (s_jammer_status_label && lv_obj_is_valid(s_jammer_status_label)) {
+        lv_label_set_text(s_jammer_status_label,
+                          running ? "STATUS: ACTIVE" : "STATUS: OFF");
+    }
+    if (s_jammer_toggle_btn && lv_obj_is_valid(s_jammer_toggle_btn)) {
+        lv_obj_t *lbl = lv_obj_get_child(s_jammer_toggle_btn, 0);
+        if (lbl && lv_obj_is_valid(lbl)) {
+            lv_label_set_text(lbl, running ? "STOP" : "START");
+        }
+    }
+    if (s_jammer_freq_label && lv_obj_is_valid(s_jammer_freq_label)) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "FREQ: %s", s_jam_freq_names[s_jam_sel]);
+        lv_label_set_text(s_jammer_freq_label, buf);
+    }
+}
+
+static void subghz_jammer_toggle_btn_cb(lv_event_t *e) {
+    (void)e;
+    if (subghz_jammer_any_running()) {
+        subghz_jammer_stop_all();
+    } else {
+        if (jam_is_nrf24(s_jam_sel)) {
+            nrf24_remote_manager_jammer_start(s_jam_freq_hz[s_jam_sel]);
+        } else {
+            subghz_remote_manager_jammer_start(s_jam_freq_hz[s_jam_sel]);
+        }
+    }
+    subghz_jammer_update_ui();
+}
+
+static void subghz_jammer_freq_btn_cb(lv_event_t *e) {
+    (void)e;
+    if (subghz_remote_manager_jammer_is_running()) {
+        return; /* lock freq change while running */
+    }
+    s_jam_sel = (jammer_freq_sel_t)((s_jam_sel + 1) % JAM_FREQ_COUNT);
+    subghz_jammer_update_ui();
+}
+
+static void subghz_jammer_back_btn_cb(lv_event_t *e) {
+    (void)e;
+    subghz_remote_manager_jammer_stop();
+    subghz_close_jammer_popup();
+}
+
+static void subghz_close_jammer_popup(void) {
+    if (!s_jammer_popup || !lv_obj_is_valid(s_jammer_popup)) {
+        return;
+    }
+    subghz_jammer_stop_all();
+    lvgl_obj_del_safe(&s_jammer_popup);
+    s_jammer_status_label = NULL;
+    s_jammer_toggle_btn   = NULL;
+    s_jammer_freq_label   = NULL;
+    s_jammer_back_btn     = NULL;
+}
+
+static void subghz_open_jammer_popup(void) {
+    if (s_jammer_popup && lv_obj_is_valid(s_jammer_popup)) {
+        return;
+    }
+
+    popup_calc_size_t sz;
+    popup_calc_size(&sz);
+
+    lv_obj_t *cont = popup_create_container(s_root, sz.width, sz.height, false);
+    if (!cont) {
+        return;
+    }
+    s_jammer_popup = cont;
+
+    lv_coord_t pw = sz.width;
+    lv_coord_t ph = sz.height;
+    lv_coord_t y  = 4;
+
+    /* title */
+    popup_create_title_label(cont, "RF JAMMER",
+                             accessibility_font(ACCESS_FONT_MEDIUM), y);
+    y += 20;
+
+    /* status label */
+    s_jammer_status_label = popup_create_body_label(
+        cont, "STATUS: OFF", pw - 16, false,
+        accessibility_font(ACCESS_FONT_SMALL), y);
+    y += 18;
+
+    /* freq label */
+    char freq_buf[32];
+    snprintf(freq_buf, sizeof(freq_buf), "FREQ: %s", s_jam_freq_names[s_jam_sel]);
+    s_jammer_freq_label = popup_create_body_label(
+        cont, freq_buf, pw - 16, false,
+        accessibility_font(ACCESS_FONT_SMALL), y);
+    y += 18;
+
+    lv_coord_t btn_h = (lv_coord_t)(ph > 140 ? 28 : 24);
+    lv_coord_t btn_w = (lv_coord_t)((pw - 24) / 2);
+
+    /* START / STOP button */
+    s_jammer_toggle_btn = popup_add_styled_button(
+        cont, "START", btn_w, btn_h,
+        LV_ALIGN_TOP_LEFT, 8, y,
+        accessibility_font(ACCESS_FONT_SMALL),
+        subghz_jammer_toggle_btn_cb, NULL);
+
+    /* FREQ cycle button */
+    popup_add_styled_button(
+        cont, "FREQ", btn_w, btn_h,
+        LV_ALIGN_TOP_RIGHT, -8, y,
+        accessibility_font(ACCESS_FONT_SMALL),
+        subghz_jammer_freq_btn_cb, NULL);
+    y += btn_h + 6;
+
+    /* BACK button */
+    s_jammer_back_btn = popup_add_styled_button(
+        cont, "BACK", pw - 16, btn_h,
+        LV_ALIGN_TOP_MID, 0, y,
+        accessibility_font(ACCESS_FONT_SMALL),
+        subghz_jammer_back_btn_cb, NULL);
+
+    popup_set_button_selected(s_jammer_toggle_btn, true);
+    subghz_jammer_update_ui();
+}
+
+static void subghz_jammer_row_cb(lv_event_t *e) {
+    (void)e;
+    subghz_open_jammer_popup();
+}
+
+/* ─────────────────────────────────────────────────────────────────────── */
+
 static void subghz_scan_row_cb(lv_event_t *e) {
     (void)e;
     if (s_ov) {
@@ -4608,6 +4802,7 @@ void subghz_view_create(void) {
     s_capture_row = options_view_add_item(s_ov, "Saved", subghz_capture_row_cb, NULL);
     s_freq_analyzer_row = options_view_add_item(s_ov, "Freq Analyzer", subghz_freq_analyzer_row_cb, NULL);
     s_waterfall_row = options_view_add_item(s_ov, "Waterfall", subghz_waterfall_row_cb, NULL);
+    s_jammer_row = options_view_add_item(s_ov, "Jammer", subghz_jammer_row_cb, NULL);
     s_back_row = options_view_add_back_row(s_ov, subghz_back_row_cb, NULL);
     if (gui_router_previous_view() == &main_menu_view) {
         s_root_selected_index = 0;
@@ -4658,6 +4853,7 @@ void subghz_view_destroy(void) {
     subghz_close_capture_popup();
     subghz_close_freq_analyzer_popup();
     subghz_close_waterfall_popup();
+    subghz_close_jammer_popup();
     popup_confirm_close(&s_saved_delete_confirm);
     subghz_close_saved_popup();
     subghz_saved_list_clear();
@@ -4675,6 +4871,7 @@ void subghz_view_destroy(void) {
     s_raw_capture_row = NULL;
     s_freq_analyzer_row = NULL;
     s_waterfall_row = NULL;
+    s_jammer_row = NULL;
     s_back_row = NULL;
 
 #ifdef CONFIG_USE_TOUCHSCREEN

@@ -10,4 +10,8 @@ bool nrf24_remote_manager_is_running(void);
 bool nrf24_remote_manager_is_paused(void);
 const char *nrf24_remote_manager_get_last_error(void);
 
+bool nrf24_remote_manager_jammer_start(uint32_t freq_hz);
+void nrf24_remote_manager_jammer_stop(void);
+bool nrf24_remote_manager_jammer_is_running(void);
+
 #endif

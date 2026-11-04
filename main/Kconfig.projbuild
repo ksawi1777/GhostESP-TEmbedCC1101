@@ -1081,6 +1081,24 @@ menu "Ghost ESP Options"
                 help
                     Delay after tuning a channel before reading RSSI.
 
+            config SUBGHZ_ANT_SW0_PIN
+                int "Antenna Switch SW0 Pin (-1 to disable)"
+                default -1
+                depends on HAS_SUBGHZ
+                help
+                    GPIO pin for RF matching network SW0 control line.
+                    Set to -1 to disable (default for most boards).
+                    LilyGO T-Embed CC1101 Plus: GPIO48.
+
+            config SUBGHZ_ANT_SW1_PIN
+                int "Antenna Switch SW1 Pin (-1 to disable)"
+                default -1
+                depends on HAS_SUBGHZ
+                help
+                    GPIO pin for RF matching network SW1 control line.
+                    Set to -1 to disable (default for most boards).
+                    LilyGO T-Embed CC1101 Plus: GPIO47.
+
         endmenu
 
         menu "LoRa Options"

@@ -9,6 +9,45 @@
 #include "core/esp_comm_manager.h"
 
 #include "driver/gpio.h"
+/* ── Antenna matching switch (LilyGO T-Embed CC1101 Plus) ─────────────────
+ * Truth table from LilyGO schematic:
+ *   SW1=1 SW0=0  →  315 MHz band  (300–348 MHz)
+ *   SW1=1 SW0=1  →  434 MHz band  (387–464 MHz)
+ *   SW1=0 SW0=1  →  868/915 MHz band  (779–928 MHz)
+ * Guarded by CONFIG_SUBGHZ_ANT_SW0_PIN >= 0 so other boards are unaffected.
+ */
+#if defined(CONFIG_SUBGHZ_ANT_SW0_PIN) && CONFIG_SUBGHZ_ANT_SW0_PIN >= 0 && \
+    defined(CONFIG_SUBGHZ_ANT_SW1_PIN) && CONFIG_SUBGHZ_ANT_SW1_PIN >= 0
+#define SUBGHZ_HAS_ANT_SWITCH 1
+static void subghz_ant_switch_init(void) {
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << CONFIG_SUBGHZ_ANT_SW0_PIN) |
+                        (1ULL << CONFIG_SUBGHZ_ANT_SW1_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+}
+static void subghz_ant_switch_apply(uint32_t freq_hz) {
+    int sw0, sw1;
+    if (freq_hz < 350000000UL) {
+        sw1 = 1; sw0 = 0; /* 315 MHz band */
+    } else if (freq_hz < 700000000UL) {
+        sw1 = 1; sw0 = 1; /* 434 MHz band */
+    } else {
+        sw1 = 0; sw0 = 1; /* 868/915 MHz band */
+    }
+    gpio_set_level((gpio_num_t)CONFIG_SUBGHZ_ANT_SW1_PIN, sw1);
+    gpio_set_level((gpio_num_t)CONFIG_SUBGHZ_ANT_SW0_PIN, sw0);
+}
+#else
+#define SUBGHZ_HAS_ANT_SWITCH 0
+#define subghz_ant_switch_init()      do {} while (0)
+#define subghz_ant_switch_apply(f)    do {} while (0)
+#endif
+/* ─────────────────────────────────────────────────────────────────────── */
 #include "driver/rmt_tx.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
@@ -935,6 +974,8 @@ static esp_err_t subghz_hw_start(void) {
     (void)cc1101_strobe(CC1101_STROBE_SFTX);
 
     s_current_freq_hz = (uint32_t)((uint64_t)CONFIG_SUBGHZ_BASE_FREQ_MHZ * 10000ULL);
+    subghz_ant_switch_init();
+    subghz_ant_switch_apply(s_current_freq_hz);
     uint32_t freq_word = (uint32_t)((((uint64_t)s_current_freq_hz) * 65536ULL) / 26000000ULL);
 
     err = cc1101_write_reg(CC1101_REG_FREQ2, (uint8_t)((freq_word >> 16) & 0xFF));
@@ -993,6 +1034,7 @@ static esp_err_t subghz_retune_frequency(uint32_t freq_hz) {
 
     subghz_radio_lock();
 
+    subghz_ant_switch_apply(freq_hz);
     uint32_t freq_word = (uint32_t)((((uint64_t)freq_hz) * 65536ULL) / 26000000ULL);
     const char *step = "SIDLE";
     esp_err_t err = cc1101_strobe(CC1101_STROBE_SIDLE);
@@ -1787,6 +1829,7 @@ bool subghz_remote_manager_transmit_raw(const int32_t *durations, size_t count, 
     if (frequency_hz == 0) {
         frequency_hz = (uint32_t)((uint64_t)CONFIG_SUBGHZ_BASE_FREQ_MHZ * 10000ULL);
     }
+    subghz_ant_switch_apply(frequency_hz);
     uint64_t f_hz = (uint64_t)frequency_hz;
     uint32_t freq_word = (uint32_t)((f_hz * 65536ULL) / 26000000ULL);
     if (err == ESP_OK) err = cc1101_write_reg(CC1101_REG_FREQ2, (uint8_t)((freq_word >> 16) & 0xFF));
@@ -2251,6 +2294,163 @@ const char *subghz_remote_manager_get_active_snapshot_name(void) {
     return s_active_snapshot_name;
 }
 
+/* ── Jammer ────────────────────────────────────────────────────────────── */
+
+static volatile bool s_jammer_running = false;
+static TaskHandle_t s_jammer_task = NULL;
+
+typedef struct {
+    uint32_t freq_hz;
+} subghz_jammer_params_t;
+
+static void subghz_jammer_task_fn(void *arg) {
+    subghz_jammer_params_t *p = (subghz_jammer_params_t *)arg;
+    uint32_t freq_hz = p->freq_hz;
+    free(p);
+
+    subghz_ant_switch_init();
+    subghz_ant_switch_apply(freq_hz);
+
+    spi_host_device_t host = subghz_spi_host_from_config();
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num   = CONFIG_SUBGHZ_SPI_MOSI_PIN,
+        .miso_io_num   = CONFIG_SUBGHZ_SPI_MISO_PIN,
+        .sclk_io_num   = CONFIG_SUBGHZ_SPI_SCK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32,
+    };
+    bool bus_owned = false;
+    esp_err_t err = spi_bus_initialize(host, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (err == ESP_OK) {
+        bus_owned = true;
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        err = ESP_OK;
+    }
+
+    spi_device_handle_t dev = NULL;
+    if (err == ESP_OK) {
+        spi_device_interface_config_t dev_cfg = {
+            .clock_speed_hz = CONFIG_SUBGHZ_SPI_CLOCK_HZ,
+            .mode           = 0,
+            .spics_io_num   = CONFIG_SUBGHZ_CSN_PIN,
+            .queue_size     = 1,
+        };
+        err = spi_bus_add_device(host, &dev_cfg, &dev);
+    }
+
+    if (err != ESP_OK || !dev) {
+        ESP_LOGE(TAG, "jammer: spi init failed");
+        goto jammer_cleanup;
+    }
+
+    /* helper inline wrappers for local SPI access */
+    #define JAM_SPI_STROBE(s)   do { \
+        uint8_t _b = (s); \
+        spi_transaction_t _t = {.length=8, .tx_buffer=&_b, .flags=SPI_TRANS_USE_RXDATA}; \
+        spi_device_polling_transmit(dev, &_t); \
+    } while(0)
+    #define JAM_WRITE_REG(r,v)  do { \
+        uint8_t _buf[2] = {(uint8_t)(r), (uint8_t)(v)}; \
+        spi_transaction_t _t = {.length=16, .tx_buffer=_buf, .flags=SPI_TRANS_USE_RXDATA}; \
+        spi_device_polling_transmit(dev, &_t); \
+    } while(0)
+
+    JAM_SPI_STROBE(CC1101_STROBE_SIDLE);
+    JAM_SPI_STROBE(CC1101_STROBE_SRES);
+    ets_delay_us(1000);
+    JAM_SPI_STROBE(CC1101_STROBE_SIDLE);
+
+    /* frequency */
+    uint32_t fw = (uint32_t)((((uint64_t)freq_hz) * 65536ULL) / 26000000ULL);
+    JAM_WRITE_REG(CC1101_REG_FREQ2, (uint8_t)((fw >> 16) & 0xFF));
+    JAM_WRITE_REG(CC1101_REG_FREQ1, (uint8_t)((fw >>  8) & 0xFF));
+    JAM_WRITE_REG(CC1101_REG_FREQ0, (uint8_t)(fw & 0xFF));
+
+    /* max TX power */
+    JAM_WRITE_REG(0x3E, 0xC0);            /* PATABLE[0] = max */
+    JAM_WRITE_REG(0x1D, 0x00);            /* FREND0: use PATABLE[0] */
+
+    /* GDO0 = async serial clock (continuous TX mode) */
+    JAM_WRITE_REG(CC1101_REG_IOCFG0, 0x0B);
+    /* GDO2 = high-Z */
+    JAM_WRITE_REG(CC1101_REG_IOCFG2, 0x2E);
+
+    /* packet ctrl: unlimited length, whitening on = PN9 noise */
+    JAM_WRITE_REG(CC1101_REG_PKTCTRL0, 0x02); /* infinite packet, PN9 whitening */
+    JAM_WRITE_REG(CC1101_REG_PKTCTRL1, 0x00);
+    JAM_WRITE_REG(CC1101_REG_PKTLEN,   0xFF);
+
+    /* OOK → FSK2: wider deviation covers more bandwidth */
+    JAM_WRITE_REG(0x10, 0x07);            /* MDMCFG4: BW ~812 kHz */
+    JAM_WRITE_REG(0x11, 0x83);            /* MDMCFG3: data rate */
+    JAM_WRITE_REG(0x12, 0x00);            /* MDMCFG2: 2-FSK, no manchester */
+    JAM_WRITE_REG(0x15, 0x34);            /* DEVIATN: ±47.6 kHz */
+
+    JAM_SPI_STROBE(CC1101_STROBE_SCAL);
+    ets_delay_us(800);
+    JAM_SPI_STROBE(CC1101_STROBE_STX);
+
+    ESP_LOGI(TAG, "jammer running @ %lu Hz", (unsigned long)freq_hz);
+
+    while (s_jammer_running) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    JAM_SPI_STROBE(CC1101_STROBE_SIDLE);
+
+    #undef JAM_SPI_STROBE
+    #undef JAM_WRITE_REG
+
+jammer_cleanup:
+    if (dev) {
+        spi_bus_remove_device(dev);
+    }
+    if (bus_owned) {
+        spi_bus_free(host);
+    }
+    ESP_LOGI(TAG, "jammer stopped");
+    s_jammer_task = NULL;
+    vTaskDelete(NULL);
+}
+
+bool subghz_remote_manager_jammer_start(uint32_t freq_hz) {
+    if (s_jammer_running || s_jammer_task) {
+        return false;
+    }
+    if (s_subghz_task) {
+        subghz_set_last_error("stop scanner before jammer");
+        return false;
+    }
+    if (!subghz_validate_pin_config()) {
+        return false;
+    }
+    subghz_jammer_params_t *p = malloc(sizeof(subghz_jammer_params_t));
+    if (!p) {
+        return false;
+    }
+    p->freq_hz = freq_hz;
+    s_jammer_running = true;
+    if (xTaskCreate(subghz_jammer_task_fn, "subghz_jammer", 4096, p,
+                    configMAX_PRIORITIES - 2, &s_jammer_task) != pdPASS) {
+        s_jammer_running = false;
+        free(p);
+        return false;
+    }
+    return true;
+}
+
+void subghz_remote_manager_jammer_stop(void) {
+    s_jammer_running = false;
+}
+
+bool subghz_remote_manager_jammer_is_running(void) {
+    return s_jammer_running;
+}
+
+/* ─────────────────────────────────────────────────────────────────────── */
+
 #else
 
 bool subghz_remote_manager_start(bool stream_to_peer) {
@@ -2348,5 +2548,11 @@ int subghz_remote_manager_list_snapshots(char names[][SUBGHZ_SNAPSHOT_NAME_MAX],
 const char *subghz_remote_manager_get_active_snapshot_name(void) {
     return "none";
 }
+bool subghz_remote_manager_jammer_start(uint32_t freq_hz) {
+    (void)freq_hz;
+    return false;
+}
+void subghz_remote_manager_jammer_stop(void) {}
+bool subghz_remote_manager_jammer_is_running(void) { return false; }
 
 #endif

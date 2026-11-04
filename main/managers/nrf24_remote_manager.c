@@ -431,6 +431,150 @@ const char *nrf24_remote_manager_get_last_error(void) {
     return s_last_error;
 }
 
+/* ── NRF24 Jammer ──────────────────────────────────────────────────────── */
+/* Uses CONT_WAVE bit (RF_SETUP[7]) — continuous carrier on selected channel.
+ * freq_hz == 0xFFFFFFFF → sweep all 126 channels (~2400–2525 MHz).
+ * Otherwise: channel = (freq_hz / 1000000) - 2400, clamped 0–125.
+ */
+
+static volatile bool s_jammer_running = false;
+static TaskHandle_t  s_jammer_task    = NULL;
+
+typedef struct { uint32_t freq_hz; } nrf24_jammer_params_t;
+
+static void nrf24_jammer_task_fn(void *arg) {
+    nrf24_jammer_params_t *p = (nrf24_jammer_params_t *)arg;
+    uint32_t freq_hz = p->freq_hz;
+    free(p);
+
+    bool sweep = (freq_hz == 0xFFFFFFFFU);
+    uint8_t fixed_ch = 0;
+    if (!sweep) {
+        uint32_t mhz = freq_hz / 1000000U;
+        fixed_ch = (mhz > 2400U && mhz <= 2525U) ? (uint8_t)(mhz - 2400U) : 2U;
+    }
+
+    spi_host_device_t host = nrf24_spi_host_from_config();
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num   = CONFIG_NRF24_SPI_MOSI_PIN,
+        .miso_io_num   = CONFIG_NRF24_SPI_MISO_PIN,
+        .sclk_io_num   = CONFIG_NRF24_SPI_SCK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32,
+    };
+    bool bus_owned = false;
+    esp_err_t err = spi_bus_initialize(host, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (err == ESP_OK) {
+        bus_owned = true;
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        err = ESP_OK; /* bus already up (shared with CC1101) */
+    }
+
+    spi_device_handle_t dev = NULL;
+    if (err == ESP_OK) {
+        spi_device_interface_config_t dev_cfg = {
+            .clock_speed_hz = CONFIG_NRF24_SPI_CLOCK_HZ,
+            .mode           = 0,
+            .spics_io_num   = CONFIG_NRF24_CSN_PIN,
+            .queue_size     = 1,
+        };
+        err = spi_bus_add_device(host, &dev_cfg, &dev);
+    }
+
+    /* CE pin */
+    gpio_config_t ce_cfg = {
+        .pin_bit_mask = (1ULL << CONFIG_NRF24_CE_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&ce_cfg);
+    gpio_set_level((gpio_num_t)CONFIG_NRF24_CE_PIN, 0);
+
+    if (err != ESP_OK || !dev) {
+        ESP_LOGE(TAG, "nrf24 jammer: spi init failed");
+        goto nrf24_jammer_cleanup;
+    }
+
+    #define NJ_WRITE(reg, val) do { \
+        uint8_t _b[2] = {(uint8_t)(0x20 | ((reg) & 0x1F)), (uint8_t)(val)}; \
+        spi_transaction_t _t = {.length=16, .tx_buffer=_b, .flags=SPI_TRANS_USE_RXDATA}; \
+        spi_device_polling_transmit(dev, &_t); \
+    } while(0)
+
+    /* power up TX, disable AA, max power, CONT_WAVE */
+    NJ_WRITE(NRF_REG_CONFIG,    0x02); /* PWR_UP=1, PRIM_RX=0 */
+    NJ_WRITE(NRF_REG_EN_AA,     0x00); /* no auto-ACK */
+    NJ_WRITE(NRF_REG_RF_SETUP,  0x87); /* CONT_WAVE=1, 1Mbps, 0dBm, LNA=1 */
+    ets_delay_us(1500);                /* tpd2stby */
+
+    if (!sweep) {
+        NJ_WRITE(NRF_REG_RF_CH, fixed_ch & 0x7F);
+        gpio_set_level((gpio_num_t)CONFIG_NRF24_CE_PIN, 1);
+        ESP_LOGI(TAG, "nrf24 jammer CW ch%u (%lu MHz)",
+                 fixed_ch, (unsigned long)(2400U + fixed_ch));
+
+        while (s_jammer_running) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    } else {
+        ESP_LOGI(TAG, "nrf24 jammer SWEEP 2400–2525 MHz");
+        uint8_t ch = 0;
+        while (s_jammer_running) {
+            gpio_set_level((gpio_num_t)CONFIG_NRF24_CE_PIN, 0);
+            NJ_WRITE(NRF_REG_RF_CH, ch & 0x7F);
+            gpio_set_level((gpio_num_t)CONFIG_NRF24_CE_PIN, 1);
+            ets_delay_us(200);
+            ch = (uint8_t)((ch + 1) % 126U);
+        }
+    }
+
+    gpio_set_level((gpio_num_t)CONFIG_NRF24_CE_PIN, 0);
+    NJ_WRITE(NRF_REG_CONFIG, 0x00); /* power down */
+    #undef NJ_WRITE
+
+nrf24_jammer_cleanup:
+    if (dev) spi_bus_remove_device(dev);
+    if (bus_owned) spi_bus_free(host);
+    ESP_LOGI(TAG, "nrf24 jammer stopped");
+    s_jammer_task = NULL;
+    vTaskDelete(NULL);
+}
+
+bool nrf24_remote_manager_jammer_start(uint32_t freq_hz) {
+    if (s_jammer_running || s_jammer_task) return false;
+    if (s_nrf24_task) {
+        nrf24_set_last_error("stop scanner before jammer");
+        return false;
+    }
+    if (!nrf24_validate_pin_config()) return false;
+
+    nrf24_jammer_params_t *p = malloc(sizeof(nrf24_jammer_params_t));
+    if (!p) return false;
+    p->freq_hz = freq_hz;
+    s_jammer_running = true;
+    if (xTaskCreate(nrf24_jammer_task_fn, "nrf24_jammer", 4096, p,
+                    configMAX_PRIORITIES - 2, &s_jammer_task) != pdPASS) {
+        s_jammer_running = false;
+        free(p);
+        return false;
+    }
+    return true;
+}
+
+void nrf24_remote_manager_jammer_stop(void) {
+    s_jammer_running = false;
+}
+
+bool nrf24_remote_manager_jammer_is_running(void) {
+    return s_jammer_running;
+}
+
+/* ─────────────────────────────────────────────────────────────────────── */
+
 #else
 
 bool nrf24_remote_manager_start(bool stream_to_peer) {
@@ -443,5 +587,8 @@ void nrf24_remote_manager_set_paused(bool paused) { (void)paused; }
 bool nrf24_remote_manager_is_running(void) { return false; }
 bool nrf24_remote_manager_is_paused(void) { return false; }
 const char *nrf24_remote_manager_get_last_error(void) { return "built without CONFIG_HAS_NRF24"; }
+bool nrf24_remote_manager_jammer_start(uint32_t freq_hz) { (void)freq_hz; return false; }
+void nrf24_remote_manager_jammer_stop(void) {}
+bool nrf24_remote_manager_jammer_is_running(void) { return false; }
 
 #endif

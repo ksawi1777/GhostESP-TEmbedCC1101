@@ -50,4 +50,8 @@ bool subghz_remote_manager_load_snapshot(const char *name_or_path);
 int subghz_remote_manager_list_snapshots(char names[][SUBGHZ_SNAPSHOT_NAME_MAX], int max_names);
 const char *subghz_remote_manager_get_active_snapshot_name(void);
 
+bool subghz_remote_manager_jammer_start(uint32_t freq_hz);
+void subghz_remote_manager_jammer_stop(void);
+bool subghz_remote_manager_jammer_is_running(void);
+
 #endif
