@@ -2303,10 +2303,29 @@ typedef struct {
     uint32_t freq_hz;
 } subghz_jammer_params_t;
 
+/* Band-sweep sentinels — must match subghz_view.c */
+#define JAM_SWEEP_433 0xFFFFFFF0U   /* 433.05–434.79 MHz */
+#define JAM_SWEEP_868 0xFFFFFFF1U   /* 868.0–869.65 MHz  */
+#define JAM_SWEEP_915 0xFFFFFFF2U   /* 902–928 MHz       */
+
 static void subghz_jammer_task_fn(void *arg) {
     subghz_jammer_params_t *p = (subghz_jammer_params_t *)arg;
     uint32_t freq_hz = p->freq_hz;
     free(p);
+
+    /* resolve band-sweep sentinels */
+    bool do_sweep = false;
+    uint32_t sweep_start = 0, sweep_end = 0, sweep_step = 0;
+    if (freq_hz == JAM_SWEEP_433) {
+        do_sweep = true; sweep_start = 433050000U; sweep_end = 434790000U; sweep_step = 150000U;
+        freq_hz = sweep_start;
+    } else if (freq_hz == JAM_SWEEP_868) {
+        do_sweep = true; sweep_start = 868000000U; sweep_end = 869650000U; sweep_step = 150000U;
+        freq_hz = sweep_start;
+    } else if (freq_hz == JAM_SWEEP_915) {
+        do_sweep = true; sweep_start = 902000000U; sweep_end = 928000000U; sweep_step = 250000U;
+        freq_hz = sweep_start;
+    }
 
     subghz_ant_switch_init();
     subghz_ant_switch_apply(freq_hz);
@@ -2368,8 +2387,9 @@ static void subghz_jammer_task_fn(void *arg) {
     JAM_WRITE_REG(CC1101_REG_FREQ1, (uint8_t)((fw >>  8) & 0xFF));
     JAM_WRITE_REG(CC1101_REG_FREQ0, (uint8_t)(fw & 0xFF));
 
-    /* max TX power */
-    JAM_WRITE_REG(0x3E, 0xC0);            /* PATABLE[0] = max */
+    /* max TX power — PATABLE value is band-dependent on CC1101 */
+    uint8_t patable = (freq_hz >= 800000000U) ? 0xC3 : 0xC0;  /* 0xC3 = max for 868/915 MHz */
+    JAM_WRITE_REG(0x3E, patable);         /* PATABLE[0] = max for this band */
     JAM_WRITE_REG(0x1D, 0x00);            /* FREND0: use PATABLE[0] */
 
     /* GDO0 = async serial clock (continuous TX mode) */
@@ -2386,16 +2406,34 @@ static void subghz_jammer_task_fn(void *arg) {
     JAM_WRITE_REG(0x10, 0x07);            /* MDMCFG4: BW ~812 kHz */
     JAM_WRITE_REG(0x11, 0x83);            /* MDMCFG3: data rate */
     JAM_WRITE_REG(0x12, 0x00);            /* MDMCFG2: 2-FSK, no manchester */
-    JAM_WRITE_REG(0x15, 0x34);            /* DEVIATN: ±47.6 kHz */
+    JAM_WRITE_REG(0x15, 0x77);            /* DEVIATN: ±381 kHz (max) — wider instantaneous coverage */
 
     JAM_SPI_STROBE(CC1101_STROBE_SCAL);
     ets_delay_us(800);
     JAM_SPI_STROBE(CC1101_STROBE_STX);
 
-    ESP_LOGI(TAG, "jammer running @ %lu Hz", (unsigned long)freq_hz);
-
-    while (s_jammer_running) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+    if (do_sweep) {
+        ESP_LOGI(TAG, "jammer SWEEP %lu–%lu Hz step %lu",
+                 (unsigned long)sweep_start, (unsigned long)sweep_end, (unsigned long)sweep_step);
+        uint32_t cur = sweep_start;
+        while (s_jammer_running) {
+            uint32_t fw = (uint32_t)((((uint64_t)cur) * 65536ULL) / 26000000ULL);
+            JAM_SPI_STROBE(CC1101_STROBE_SIDLE);
+            JAM_WRITE_REG(CC1101_REG_FREQ2, (uint8_t)((fw >> 16) & 0xFF));
+            JAM_WRITE_REG(CC1101_REG_FREQ1, (uint8_t)((fw >>  8) & 0xFF));
+            JAM_WRITE_REG(CC1101_REG_FREQ0, (uint8_t)(fw & 0xFF));
+            JAM_SPI_STROBE(CC1101_STROBE_SCAL);
+            ets_delay_us(800);
+            JAM_SPI_STROBE(CC1101_STROBE_STX);
+            ets_delay_us(500);
+            cur += sweep_step;
+            if (cur > sweep_end) cur = sweep_start;
+        }
+    } else {
+        ESP_LOGI(TAG, "jammer running @ %lu Hz", (unsigned long)freq_hz);
+        while (s_jammer_running) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
     }
 
     JAM_SPI_STROBE(CC1101_STROBE_SIDLE);

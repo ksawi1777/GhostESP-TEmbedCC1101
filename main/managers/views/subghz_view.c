@@ -142,6 +142,9 @@ typedef enum {
     JAM_FREQ_868,
     JAM_FREQ_315,
     JAM_FREQ_915,
+    JAM_FREQ_433_BAND,   /* CC1101: sweep 433.05–434.79 MHz (full ISM band) */
+    JAM_FREQ_868_BAND,   /* CC1101: sweep 868.0–869.65 MHz (full ISM band)  */
+    JAM_FREQ_915_BAND,   /* CC1101: sweep 902–928 MHz (full ISM band, US)   */
     JAM_FREQ_NRF_BT,     /* NRF24: 2402 MHz — BT advertising ch37 */
     JAM_FREQ_NRF_WIFI6,  /* NRF24: 2437 MHz — WiFi ch6            */
     JAM_FREQ_NRF_SWEEP,  /* NRF24: sweep 2400–2525 MHz            */
@@ -150,12 +153,15 @@ typedef enum {
 
 static const char *s_jam_freq_names[JAM_FREQ_COUNT] = {
     "433.92 MHz", "868.35 MHz", "315 MHz", "915 MHz",
+    "433 FULL BAND", "868 FULL BAND", "915 FULL BAND",
     "NRF BT 2402", "NRF WiFi 2437", "NRF Sweep"
 };
-/* NRF24 entries: >= 2 GHz → routed to nrf24 jammer.
- * 0xFFFFFFFF = sweep sentinel. */
+/* CC1101 band-sweep sentinels: 0xFFFFFFF0–0xFFFFFFF2.
+ * NRF24 entries: >= JAM_FREQ_NRF_BT → routed to nrf24 jammer.
+ * NRF24 sweep sentinel: 0xFFFFFFFF. */
 static const uint32_t s_jam_freq_hz[JAM_FREQ_COUNT] = {
     433920000U, 868350000U, 315000000U, 915000000U,
+    0xFFFFFFF0U, 0xFFFFFFF1U, 0xFFFFFFF2U,
     2402000000U, 2437000000U, 0xFFFFFFFFU
 };
 
